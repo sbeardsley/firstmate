@@ -1051,12 +1051,15 @@ fi
 # process (go build, go test, ...) inherit it. Sent before the launch command so
 # the env is set when the agent starts; the brief sleep lets the export land.
 spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp"
-# Export the task identity into the crewmate pane so user-global pi extensions
-# (e.g. loop detection) can locate the per-task status file via FM_TASK_ID/FM_HOME.
-# FM_HOME is usually inherited but is exported explicitly so the pair is present
-# together; a --secondmate launch prefixes FM_HOME=<secondmate-home> on the
-# launch command, which overrides this export for that command, so both kinds are safe.
-spawn_send_text_line "$T" "export FM_TASK_ID=$ID FM_HOME=$FM_HOME"
+# Export the task identity (FM_TASK_ID, FM_HOME) and FM_LOOP_BLOCK=1 into the
+# crewmate pane so user-global pi extensions such as loop detection can locate
+# the per-task status file and best-effort abort a stuck reasoning turn.
+# FM_LOOP_BLOCK flips the extension's abort on (notification-only by default);
+# crewmate-scoped only - the primary firstmate session never sets it. FM_HOME is
+# exported explicitly so the pair is present together; a --secondmate launch
+# prefixes FM_HOME on the launch command, which overrides this export, so both
+# kinds are safe.
+spawn_send_text_line "$T" "export FM_TASK_ID=$ID FM_HOME=$FM_HOME FM_LOOP_BLOCK=1"
 sleep 0.3
 spawn_send_literal "$T" "$LAUNCH"
 sleep 0.3

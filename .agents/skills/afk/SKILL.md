@@ -136,7 +136,7 @@ While `state/.afk` exists the daemon owns the watcher, so the watcher reverts to
 Classify each wake this way:
 
 - `signal` whose status content has no captain-relevant verb
-  (`done:|needs-decision:|blocked:|failed:|PR ready|checks green|ready in branch|merged`)
+  (`done:|needs-decision:|blocked:|failed:|PR ready|checks green|ready in branch|merged|loop:`)
   -> self-handle. Captain-relevant verb -> escalate.
 - `signal` or `stale` for a declared `paused:` external wait -> self-handle and track the pause rather than a wedge.
   If it remains declared and idle past `FM_PAUSE_RESURFACE_SECS` (default 3600s), housekeeping sends one awaiting-external recheck and resets the pause window.

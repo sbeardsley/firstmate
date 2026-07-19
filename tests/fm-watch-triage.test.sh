@@ -114,9 +114,11 @@ test_scan_captain_relevant_statuses_classifier() {
   printf 'working: a\n' > "$state/one.status"
   printf 'blocked: no perms\n' > "$state/two.status"
   printf 'done: PR https://x/y/pull/1\n' > "$state/three.status"
+  printf 'loop: reasoning 90s thinking with no output or tool call\n' > "$state/four.status"
   out=$(scan_captain_relevant_statuses "$state")
   printf '%s' "$out" | grep -F "two.status" >/dev/null || fail "scan missed a blocked: status"
   printf '%s' "$out" | grep -F "three.status" >/dev/null || fail "scan missed a done: status"
+  printf '%s' "$out" | grep -F "four.status" >/dev/null || fail "scan missed a loop: status"
   printf '%s' "$out" | grep -F "one.status" >/dev/null && fail "scan surfaced a benign working: status"
   pass "scan_captain_relevant_statuses lists only captain-relevant statuses"
 }
@@ -129,6 +131,9 @@ test_classifier_primitives() {
   status_is_captain_relevant "done: b" || fail "done: not recognized as captain-relevant"
   status_is_captain_relevant "needs-decision [key=q1]: b" || fail "keyed needs-decision not recognized as captain-relevant"
   status_is_captain_relevant "working: b" && fail "working: wrongly recognized as captain-relevant"
+  # loop: is captain-relevant (extension-detected reasoning loop) but NOT paused.
+  status_is_captain_relevant "loop: reasoning 90s thinking with no output or tool call" || fail "loop: not recognized as captain-relevant"
+  status_is_paused "loop: reasoning 90s thinking with no output or tool call" && fail "loop classified as paused"
   [ "$(window_to_task "sess:fm-fix-login-k3")" = "fix-login-k3" ] || fail "window_to_task did not strip session+fm- prefix"
   fm_write_meta "$state/herdr-task.meta" "window=default:w1:p2" "backend=herdr"
   [ "$(window_to_task "default:w1:p2" "$state")" = "herdr-task" ] || fail "window_to_task did not resolve opaque backend target through metadata"
@@ -212,6 +217,8 @@ test_status_is_paused_classifier() {
   status_is_paused 'working: paused the animation loop' && fail "a working line mentioning paused false-matched"
   status_is_paused 'done: shipped' && fail "done classified as paused"
   status_is_paused '' && fail "empty line classified as paused"
+  # loop: is the loop-detector verb; captain-relevant but NOT a pause.
+  status_is_paused 'loop: reasoning 90s thinking with no output or tool call' && fail "loop classified as paused"
   # A pause is deliberately NOT captain-relevant: it is a stop-nagging signal, not
   # work to keep surfacing.
   status_is_captain_relevant 'paused: holding for the upstream release' && fail "paused is captain-relevant (should not be)"

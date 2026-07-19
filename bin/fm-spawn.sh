@@ -1051,6 +1051,12 @@ fi
 # process (go build, go test, ...) inherit it. Sent before the launch command so
 # the env is set when the agent starts; the brief sleep lets the export land.
 spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp"
+# Export FM_TASK_ID, FM_HOME, and FM_LOOP_BLOCK=1 into the crewmate's pane shell
+# so the loop-detector extension (pi-extensions/firstmate-pi-loop.ts) can best-effort
+# abort a stuck reasoning turn. The extension is notification-only by default; FM_LOOP_BLOCK
+# flips the abort on. Crewmate-scoped only: the primary firstmate session never sets it.
+sleep 0.3
+spawn_send_text_line "$T" "export FM_TASK_ID=$ID FM_HOME=$FM_HOME FM_LOOP_BLOCK=1"
 sleep 0.3
 spawn_send_literal "$T" "$LAUNCH"
 sleep 0.3

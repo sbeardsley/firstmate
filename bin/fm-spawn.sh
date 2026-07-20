@@ -1053,8 +1053,10 @@ fi
 spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp"
 # Export the task identity (FM_TASK_ID, FM_HOME) and FM_LOOP_BLOCK=1 into the
 # crewmate pane so user-global pi extensions such as loop detection can locate
-# the per-task status file and best-effort abort a stuck reasoning turn.
-# FM_LOOP_BLOCK flips the extension's abort on (notification-only by default);
+# the per-task status file and best-effort abort a stuck turn or block a
+# looping tool call. FM_LOOP_BLOCK flips the extension's abort/block on (without
+# it, notification-only apart from the FM_LOOP_BAN session ban; detector kinds
+# live in the pi-extensions/firstmate-pi-loop.ts header);
 # crewmate-scoped only - the primary firstmate session never sets it. FM_HOME is
 # exported explicitly so the pair is present together; a --secondmate launch
 # prefixes FM_HOME on the launch command, which overrides this export, so both

@@ -15,14 +15,27 @@
 #     from the worker tool alone.
 #     An explicit profile vendor string wins when present and remains optional
 #     for backward compatibility.
-#     Otherwise Claude, Codex, and Grok harnesses map to their same-named quota
+#     Otherwise Claude and Codex harnesses map to their same-named quota
 #     vendors, and Pi models ending in -cloud map to the Ollama quota vendor.
 #     There is intentionally no generic Pi quota vendor.
+#     Only vendors whose general-window ids are verified against real quota-axi
+#     output are mapped here; a harness whose windows are unverified stays
+#     unmapped on purpose, because a wrong window id silently excludes every
+#     candidate for that vendor instead of failing loudly.
 #   - Per candidate quota vendor it takes the minimum percentRemaining across
-#     that vendor's GENERAL windows only - Claude five_hour and seven_day, Codex
-#     five_hour and weekly, Grok five_hour and seven_day, and Ollama five_hour
-#     and weekly - ignoring model-scoped windows such as model:fable and
-#     model:codex_bengalfox:*.
+#     that vendor's GENERAL windows only - Claude five_hour and seven_day, and
+#     Codex five_hour and weekly - ignoring model-scoped windows such as
+#     model:fable and model:codex_bengalfox:*.
+#   - The Ollama mapping is STAGED AHEAD OF ITS PROVIDER. As of quota-axi's
+#     current provider set (claude, codex, cursor, copilot, grok) there is no
+#     ollama provider, so a Pi -cloud candidate resolves to vendor "ollama",
+#     finds no matching provider, and is excluded from quota comparison with an
+#     "absent from quota output" stderr line - dispatch still proceeds via the
+#     other candidates or the mapped fallback. The mapping only starts changing
+#     selection once quota-axi reports an ollama provider carrying five_hour and
+#     weekly general windows; that provider shape is the contract this selector
+#     assumes, and both sides of it are fixture-tested in
+#     tests/fm-dispatch-select.test.sh.
 #   - The vendor with the higher minimum remaining quota wins; an exact tie
 #     between equally trusted candidates uses the first array element.
 #   - Stale-but-cached general-window numbers are usable, but a fresh candidate
@@ -38,8 +51,11 @@
 #     element only when none is mapped - quota trouble never blocks dispatch.
 #
 # quota-balanced uses quota-axi --json unless --quota-json supplies a fixture.
-# --quota-vendor-diagnostics prints non-fatal CREW_DISPATCH diagnostics for
+# --quota-vendor-diagnostics prints non-actionable BOOTSTRAP_INFO facts for
 # quota-balanced config candidates that have no known quota vendor and exits.
+# These describe a static config, so bootstrap emits them only under
+# FM_BOOTSTRAP_VERBOSE_FACTS; the per-dispatch exclusion lines above are the
+# actionable runtime signal and are always logged to stderr.
 # FM_DISPATCH_QUOTA_AXI overrides the quota command.
 # FM_DISPATCH_STALE_CLEAR_MARGIN overrides the default 20 point stale margin.
 set -u
@@ -58,7 +74,7 @@ JQ_VENDOR_LIB='
   def profile_label($p):
     ($p.harness // "unknown" | tostring)
     + (if ($p.model? | type) == "string" then "/" + $p.model else "" end);
-  def known_vendors: ["claude", "codex", "grok", "ollama"];
+  def known_vendors: ["claude", "codex", "ollama"];
   def explicit_vendor($p):
     if ($p.vendor? | type) == "string" and ($p.vendor | length) > 0 then $p.vendor else null end;
   def inferred_vendor($p):
@@ -66,7 +82,6 @@ JQ_VENDOR_LIB='
     | (if ($p.model? | type) == "string" then $p.model else "" end) as $m
     | if $h == "claude" then "claude"
       elif $h == "codex" then "codex"
-      elif $h == "grok" then "grok"
       elif $h == "pi" and ($m | test("-cloud$")) then "ollama"
       else null
       end;
@@ -78,7 +93,6 @@ JQ_VENDOR_LIB='
   def general_ids($v):
     if $v == "claude" then ["five_hour", "seven_day"]
     elif $v == "codex" then ["five_hour", "weekly"]
-    elif $v == "grok" then ["five_hour", "seven_day"]
     elif $v == "ollama" then ["five_hour", "weekly"]
     else []
     end;
@@ -171,9 +185,9 @@ if [ "$QUOTA_VENDOR_DIAGNOSTICS" = 1 ]; then
     | . as $p
     | (vendor_for($p)) as $vendor
     | if $vendor == null then
-        "CREW_DISPATCH: quota-balanced candidate " + profile_label($p) + " has no known quota vendor; selector excludes it from quota comparison"
+        "BOOTSTRAP_INFO: quota-balanced candidate " + profile_label($p) + " has no known quota vendor; selector excludes it from quota comparison"
       elif (vendor_known($vendor) | not) then
-        "CREW_DISPATCH: quota-balanced candidate " + profile_label($p) + " declares unknown quota vendor " + ($vendor | @json) + "; selector excludes it from quota comparison"
+        "BOOTSTRAP_INFO: quota-balanced candidate " + profile_label($p) + " declares unknown quota vendor " + ($vendor | @json) + "; selector excludes it from quota comparison"
       else empty
       end
   ' 2>/dev/null || true

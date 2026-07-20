@@ -87,6 +87,8 @@ test_exact_tie_uses_first_profile() {
   pass "quota-balanced exact tie uses the first ordered profile"
 }
 
+# Pins the behavior the staged ollama mapping unlocks: it changes selection only
+# once quota-axi actually reports an ollama provider with five_hour and weekly.
 test_pi_cloud_uses_ollama_vendor() {
   local quota out profiles_pi
   profiles_pi='[{"harness":"pi","model":"glm-5.2-cloud","effort":"high"},{"harness":"codex","model":"gpt-5.5","effort":"high"}]'
@@ -99,37 +101,77 @@ test_pi_cloud_uses_ollama_vendor() {
   pass "quota-balanced maps pi -cloud models to the ollama quota vendor"
 }
 
-test_grok_uses_grok_vendor() {
-  local quota out profiles_grok
-  profiles_grok='[{"harness":"grok","model":"grok-4","effort":"high"},{"harness":"codex","model":"gpt-5.5","effort":"high"}]'
-  quota="$TMP_ROOT/grok.json"
+# The ollama quota vendor is staged ahead of its provider: quota-axi's current
+# provider set is claude, codex, cursor, copilot, grok. This fixture mirrors that
+# real shape, so it pins what pi -cloud candidates actually do today.
+test_pi_cloud_is_excluded_without_ollama_capable_quota_axi() {
+  local quota out err status profiles_pi
+  profiles_pi='[{"harness":"pi","model":"glm-5.2-cloud","effort":"high"},{"harness":"codex","model":"gpt-5.5","effort":"high"}]'
+  quota="$TMP_ROOT/no-ollama-provider.json"
+  cat > "$quota" <<'JSON'
+{
+  "providers": [
+    { "provider": "claude", "state": { "status": "auth_required" }, "windows": [] },
+    {
+      "provider": "codex",
+      "state": { "status": "fresh" },
+      "windows": [
+        { "id": "five_hour", "kind": "session", "percentRemaining": 40 },
+        { "id": "weekly", "kind": "weekly", "percentRemaining": 50 },
+        { "id": "model:codex_bengalfox:5h", "kind": "model", "percentRemaining": 100 }
+      ]
+    },
+    { "provider": "cursor", "state": { "status": "auth_required" }, "windows": [] },
+    { "provider": "copilot", "state": { "status": "auth_required" }, "windows": [] },
+    { "provider": "grok", "state": { "status": "auth_required" }, "windows": [] }
+  ]
+}
+JSON
+
+  out=$("$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced --quota-json "$quota" "$profiles_pi" 2>"$TMP_ROOT/no-ollama-provider.err")
+  status=$?
+  err=$(cat "$TMP_ROOT/no-ollama-provider.err")
+  expect_code 0 "$status" "a quota-axi without an ollama provider must not block dispatch"
+  [ "$out" = '{"harness":"codex","model":"gpt-5.5","effort":"high"}' ] \
+    || fail "pi cloud should be excluded when no ollama provider is reported, got: $out"
+  assert_contains "$err" "candidate 0 (pi/glm-5.2-cloud) quota vendor \"ollama\" absent from quota output" \
+    "the staged ollama vendor should be reported as absent, not silently dropped"
+  pass "pi -cloud candidates degrade non-blockingly until quota-axi reports an ollama provider"
+}
+
+test_ollama_general_windows_match_the_assumed_provider_shape() {
+  local quota out profiles_pi
+  profiles_pi='[{"harness":"pi","model":"glm-5.2-cloud","effort":"high"},{"harness":"codex","model":"gpt-5.5","effort":"high"}]'
+  quota="$TMP_ROOT/ollama-wrong-windows.json"
   cat > "$quota" <<'JSON'
 {
   "providers": [
     {
-      "provider": "grok",
+      "provider": "ollama",
       "state": { "status": "fresh" },
       "windows": [
-        { "id": "five_hour", "kind": "session", "percentRemaining": 80 },
-        { "id": "seven_day", "kind": "weekly", "percentRemaining": 75 }
+        { "id": "seven_day", "kind": "weekly", "percentRemaining": 100 }
       ]
     },
     {
       "provider": "codex",
       "state": { "status": "fresh" },
       "windows": [
-        { "id": "five_hour", "kind": "session", "percentRemaining": 10 },
-        { "id": "weekly", "kind": "weekly", "percentRemaining": 10 }
+        { "id": "five_hour", "kind": "session", "percentRemaining": 40 },
+        { "id": "weekly", "kind": "weekly", "percentRemaining": 50 }
       ]
     }
   ]
 }
 JSON
 
-  out=$("$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced --quota-json "$quota" "$profiles_grok")
-  [ "$out" = '{"harness":"grok","model":"grok-4","effort":"high"}' ] \
-    || fail "grok profile should use grok quota and beat constrained codex, got: $out"
-  pass "quota-balanced maps grok profiles to the grok quota vendor"
+  out=$("$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced --quota-json "$quota" "$profiles_pi" 2>"$TMP_ROOT/ollama-wrong-windows.err")
+  [ "$out" = '{"harness":"codex","model":"gpt-5.5","effort":"high"}' ] \
+    || fail "an ollama provider without the assumed windows should be excluded, got: $out"
+  assert_contains "$(cat "$TMP_ROOT/ollama-wrong-windows.err")" \
+    "candidate 0 (pi/glm-5.2-cloud) quota vendor \"ollama\" has no usable general windows" \
+    "a mismatched ollama window shape should be reported, not silently dropped"
+  pass "the ollama mapping states its five_hour/weekly window contract and reports a mismatch"
 }
 
 test_explicit_vendor_override_wins_and_is_not_output() {
@@ -311,9 +353,9 @@ test_quota_vendor_diagnostics() {
   config='{"rules":[{"when":"big work","use":[{"harness":"pi","model":"openai-codex/gpt-5.6-sol"},{"harness":"pi","model":"glm-5.2-cloud"},{"harness":"opencode","model":"anthropic/claude-sonnet-4-5","vendor":"mystery"}],"select":"quota-balanced"},{"when":"normal","use":[{"harness":"pi","model":"openai-codex/gpt-5.6-sol"}]}]}'
   out=$("$ROOT/bin/fm-dispatch-select.sh" --quota-vendor-diagnostics "$config")
 
-  assert_contains "$out" "CREW_DISPATCH: quota-balanced candidate pi/openai-codex/gpt-5.6-sol has no known quota vendor" \
+  assert_contains "$out" "BOOTSTRAP_INFO: quota-balanced candidate pi/openai-codex/gpt-5.6-sol has no known quota vendor" \
     "diagnostics should surface unmapped quota-balanced candidates"
-  assert_contains "$out" "CREW_DISPATCH: quota-balanced candidate opencode/anthropic/claude-sonnet-4-5 declares unknown quota vendor \"mystery\"" \
+  assert_contains "$out" "BOOTSTRAP_INFO: quota-balanced candidate opencode/anthropic/claude-sonnet-4-5 declares unknown quota vendor \"mystery\"" \
     "diagnostics should surface unknown explicit vendors"
   assert_not_contains "$out" "pi/glm-5.2-cloud" "diagnostics should not warn for mapped pi cloud models"
   pass "quota vendor diagnostics reports only quota-balanced profiles without known vendors"
@@ -346,7 +388,8 @@ SH
 test_higher_min_vendor_wins
 test_exact_tie_uses_first_profile
 test_pi_cloud_uses_ollama_vendor
-test_grok_uses_grok_vendor
+test_pi_cloud_is_excluded_without_ollama_capable_quota_axi
+test_ollama_general_windows_match_the_assumed_provider_shape
 test_explicit_vendor_override_wins_and_is_not_output
 test_quota_missing_falls_back_to_first
 test_quota_error_falls_back_to_first

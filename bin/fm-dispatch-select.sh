@@ -2,7 +2,7 @@
 # Resolve one already-matched crew-dispatch rule to a concrete profile.
 # Usage:
 #   fm-dispatch-select.sh [--select <strategy>] [--quota-json <file>] [<rule-or-use-json>]
-#   fm-dispatch-select.sh --quota-vendor-diagnostics [<config-or-rule-json>]
+#   fm-dispatch-select.sh --quota-vendor-facts [<config-or-rule-json>]
 #
 # Input may be a full rule object with `use` and optional `select`, a single
 # profile object, or an ordered array of profile objects.
@@ -21,7 +21,22 @@
 #     Only vendors whose general-window ids are verified against real quota-axi
 #     output are mapped here; a harness whose windows are unverified stays
 #     unmapped on purpose, because a wrong window id silently excludes every
-#     candidate for that vendor instead of failing loudly.
+#     candidate for that vendor instead of failing loudly. Grok is deferred for
+#     exactly this reason - its provider reports auth_required with zero windows
+#     locally, so its general-window ids are unconfirmed.
+#   - An explicit vendor value is EITHER a bare quota provider ("ollama") OR a
+#     provider-qualified upstream model reference ("ollama:glm-5.2:cloud").
+#     Only the FIRST colon separates; the prefix is the quota provider and the
+#     entire remainder is one opaque upstream model reference that this selector
+#     never interprets. An empty prefix (":x") or empty remainder ("ollama:") is
+#     malformed. The provider prefix must be one of the mapped vendors above -
+#     an explicit vendor selects among mapped providers, it cannot introduce an
+#     unmapped one, because a provider with no verified window ids has nothing to
+#     compare. Malformed values, unknown providers, and unmapped candidates are
+#     all reported rather than silently dropped.
+#     Ollama quota is account-level today, so only the provider prefix selects
+#     windows; the opaque remainder is preserved in config and echoed in
+#     diagnostics for future model-scoped support, never treated as a quota key.
 #   - Per candidate quota vendor it takes the minimum percentRemaining across
 #     that vendor's GENERAL windows only - Claude five_hour and seven_day, and
 #     Codex five_hour and weekly - ignoring model-scoped windows such as
@@ -51,8 +66,9 @@
 #     element only when none is mapped - quota trouble never blocks dispatch.
 #
 # quota-balanced uses quota-axi --json unless --quota-json supplies a fixture.
-# --quota-vendor-diagnostics prints non-actionable BOOTSTRAP_INFO facts for
-# quota-balanced config candidates that have no known quota vendor and exits.
+# --quota-vendor-facts prints non-actionable BOOTSTRAP_INFO facts for
+# quota-balanced config candidates whose quota vendor is absent, malformed, or
+# an unknown provider, then exits.
 # These describe a static config, so bootstrap emits them only under
 # FM_BOOTSTRAP_VERBOSE_FACTS; the per-dispatch exclusion lines above are the
 # actionable runtime signal and are always logged to stderr.
@@ -63,7 +79,7 @@ set -u
 STALE_CLEAR_MARGIN=${FM_DISPATCH_STALE_CLEAR_MARGIN:-20}
 SELECT_OVERRIDE=
 QUOTA_JSON_FILE=
-QUOTA_VENDOR_DIAGNOSTICS=0
+QUOTA_VENDOR_FACTS=0
 ARGS=()
 # shellcheck disable=SC2016 # This is jq source; jq variables must not expand in the shell.
 JQ_VENDOR_LIB='
@@ -85,11 +101,35 @@ JQ_VENDOR_LIB='
       elif $h == "pi" and ($m | test("-cloud$")) then "ollama"
       else null
       end;
-  def vendor_for($p): explicit_vendor($p) // inferred_vendor($p);
-  def vendor_known($v): (($v | type) == "string") and ((known_vendors | index($v)) != null);
+  def vendor_spec($p):
+    (explicit_vendor($p) // inferred_vendor($p)) as $v
+    | if $v == null then null
+      else
+        ($v | index(":")) as $i
+        | if $i == null then {raw: $v, provider: $v, ref: null, malformed: false}
+          else
+            ($v[0:$i]) as $prefix
+            | ($v[$i + 1:]) as $suffix
+            | {
+                raw: $v,
+                provider: $prefix,
+                ref: (if ($suffix | length) > 0 then $suffix else null end),
+                malformed: (($prefix | length) == 0 or ($suffix | length) == 0)
+              }
+          end
+      end;
+  def vendor_display($s):
+    ($s.raw | @json)
+    + (if $s.ref == null then ""
+       else " (quota provider " + ($s.provider | @json)
+            + ", upstream model reference " + ($s.ref | @json) + ")"
+       end);
+  def vendor_provider_known($s): (known_vendors | index($s.provider)) != null;
   def quota_vendor($p):
-    (vendor_for($p)) as $v
-    | if vendor_known($v) then $v else null end;
+    (vendor_spec($p)) as $s
+    | if $s != null and ($s.malformed | not) and vendor_provider_known($s) then $s.provider
+      else null
+      end;
   def general_ids($v):
     if $v == "claude" then ["five_hour", "seven_day"]
     elif $v == "codex" then ["five_hour", "weekly"]
@@ -112,8 +152,8 @@ log() {
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --quota-vendor-diagnostics)
-      QUOTA_VENDOR_DIAGNOSTICS=1
+    --quota-vendor-facts)
+      QUOTA_VENDOR_FACTS=1
       shift
       ;;
     --select)
@@ -165,7 +205,7 @@ else
   SPEC_JSON=$(cat)
 fi
 
-if [ "$QUOTA_VENDOR_DIAGNOSTICS" = 1 ]; then
+if [ "$QUOTA_VENDOR_FACTS" = 1 ]; then
   printf '%s\n' "$SPEC_JSON" | jq -r "$JQ_VENDOR_LIB"'
     def use_profiles($u):
       if ($u | type) == "array" then $u
@@ -183,11 +223,13 @@ if [ "$QUOTA_VENDOR_DIAGNOSTICS" = 1 ]; then
     quota_rules
     | use_profiles(.use?)[]?
     | . as $p
-    | (vendor_for($p)) as $vendor
-    | if $vendor == null then
+    | (vendor_spec($p)) as $s
+    | if $s == null then
         "BOOTSTRAP_INFO: quota-balanced candidate " + profile_label($p) + " has no known quota vendor; selector excludes it from quota comparison"
-      elif (vendor_known($vendor) | not) then
-        "BOOTSTRAP_INFO: quota-balanced candidate " + profile_label($p) + " declares unknown quota vendor " + ($vendor | @json) + "; selector excludes it from quota comparison"
+      elif $s.malformed then
+        "BOOTSTRAP_INFO: quota-balanced candidate " + profile_label($p) + " declares malformed quota vendor " + ($s.raw | @json) + "; expected \"<provider>\" or \"<provider>:<upstream model reference>\"; selector excludes it from quota comparison"
+      elif (vendor_provider_known($s) | not) then
+        "BOOTSTRAP_INFO: quota-balanced candidate " + profile_label($p) + " declares unknown quota vendor " + vendor_display($s) + "; selector excludes it from quota comparison"
       else empty
       end
   ' 2>/dev/null || true
@@ -282,15 +324,18 @@ selection=$(printf '%s\n' "$quota_json" | jq -ec \
     {index: $i, profile: clean($p), excluded: true, message: $message};
   def candidate_metric($p; $i):
     . as $root
-    | (vendor_for($p)) as $vendor
-    | if $vendor == null then
+    | (vendor_spec($p)) as $s
+    | if $s == null then
         excluded($i; $p; "candidate \($i) (" + profile_label($p) + ") has no known quota vendor; excluded from quota comparison")
-      elif (vendor_known($vendor) | not) then
-        excluded($i; $p; "candidate \($i) (" + profile_label($p) + ") declares unknown quota vendor " + ($vendor | @json) + "; excluded from quota comparison")
+      elif $s.malformed then
+        excluded($i; $p; "candidate \($i) (" + profile_label($p) + ") declares malformed quota vendor " + ($s.raw | @json) + "; expected \"<provider>\" or \"<provider>:<upstream model reference>\"; excluded from quota comparison")
+      elif (vendor_provider_known($s) | not) then
+        excluded($i; $p; "candidate \($i) (" + profile_label($p) + ") declares unknown quota vendor " + vendor_display($s) + "; excluded from quota comparison")
       else
-        ($root | provider_for($vendor)) as $provider
+        ($s.provider) as $vendor
+        | ($root | provider_for($vendor)) as $provider
         | if $provider == null then
-            excluded($i; $p; "candidate \($i) (" + profile_label($p) + ") quota vendor " + ($vendor | @json) + " absent from quota output; excluded from quota comparison")
+            excluded($i; $p; "candidate \($i) (" + profile_label($p) + ") quota vendor " + vendor_display($s) + " absent from quota output; excluded from quota comparison")
           else {
             index: $i,
             profile: clean($p),
@@ -303,7 +348,7 @@ selection=$(printf '%s\n' "$quota_json" | jq -ec \
                 and (($window.kind? // "") != "model")
                 and (($window.percentRemaining? | type) == "number")))) as $windows
           | if ($windows | length) == 0 then
-              excluded($i; $p; "candidate \($i) (" + profile_label($p) + ") quota vendor " + ($vendor | @json) + " has no usable general windows; excluded from quota comparison")
+              excluded($i; $p; "candidate \($i) (" + profile_label($p) + ") quota vendor " + vendor_display($s) + " has no usable general windows; excluded from quota comparison")
             else
               $base
               + {

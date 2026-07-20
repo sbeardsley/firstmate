@@ -751,7 +751,7 @@ test_crew_dispatch_quota_vendor_facts_are_verbose_only() {
   case_dir="$TMP_ROOT/dispatch-quota-vendor"
   mkdir -p "$case_dir/home/config"
   printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
-  printf '%s\n' '{"rules":[{"when":"unknown upstream","use":[{"harness":"pi","model":"openai-codex/gpt-5.6-sol","effort":"max"},{"harness":"pi","model":"glm-5.2","effort":"high","vendor":"pi"},{"harness":"pi","model":"glm-5.2-cloud","effort":"high"}],"select":"quota-balanced"}]}' > "$case_dir/home/config/crew-dispatch.json"
+  printf '%s\n' '{"rules":[{"when":"unknown upstream","use":[{"harness":"pi","model":"openai-codex/gpt-5.6-sol","effort":"max"},{"harness":"pi","model":"glm-5.2","effort":"high","vendor":"pi"},{"harness":"pi","model":"glm-5.2-cloud","effort":"high"},{"harness":"pi","model":"glm-5.3","effort":"high","vendor":"ollama:glm-5.3:cloud"},{"harness":"pi","model":"glm-5.4","effort":"high","vendor":"ollama:"}],"select":"quota-balanced"}]}' > "$case_dir/home/config/crew-dispatch.json"
   fakebin=$(make_fake_toolchain "$case_dir")
   add_real_jq "$fakebin"
 
@@ -766,6 +766,9 @@ test_crew_dispatch_quota_vendor_facts_are_verbose_only() {
   assert_contains "$out" "BOOTSTRAP_INFO: quota-balanced candidate pi/glm-5.2 declares unknown quota vendor \"pi\"" \
     "verbose facts should surface unknown explicit vendors"
   assert_not_contains "$out" "candidate pi/glm-5.2-cloud" "mapped pi cloud models need no verbose fact"
+  assert_not_contains "$out" "candidate pi/glm-5.3" "a well-formed provider-qualified vendor needs no verbose fact"
+  assert_contains "$out" "BOOTSTRAP_INFO: quota-balanced candidate pi/glm-5.4 declares malformed quota vendor \"ollama:\"" \
+    "verbose facts should surface malformed vendor values"
   assert_not_contains "$out" "CREW_DISPATCH" "static quota vendor facts must not read as an actionable diagnostic"
   pass "quota vendor mapping facts are verbose-only BOOTSTRAP_INFO, never a recurring CREW_DISPATCH diagnostic"
 }
@@ -803,6 +806,8 @@ unsupported opencode effort is flagged^{"rules":[{"when":"opencode work","use":{
 array use with quota-balanced is accepted^{"rules":[{"when":"big feature","use":[{"harness":"claude","model":"claude-sonnet-5","effort":"high"},{"harness":"codex","model":"gpt-5.5","effort":"high"}],"select":"quota-balanced"}]}^empty^
 pi cloud quota-balanced is accepted^{"rules":[{"when":"glm work","use":[{"harness":"pi","model":"glm-5.2-cloud","effort":"high"},{"harness":"codex","model":"gpt-5.5","effort":"high"}],"select":"quota-balanced"}]}^empty^
 explicit quota vendor override is accepted^{"rules":[{"when":"custom upstream","use":[{"harness":"pi","model":"glm-5.2","effort":"high","vendor":"ollama"},{"harness":"codex","model":"gpt-5.5","effort":"high"}],"select":"quota-balanced"}]}^empty^
+provider-qualified quota vendor is accepted^{"rules":[{"when":"qualified upstream","use":[{"harness":"pi","model":"glm-5.2","effort":"high","vendor":"ollama:glm-5.2:cloud"},{"harness":"codex","model":"gpt-5.5","effort":"high"}],"select":"quota-balanced"}]}^empty^
+malformed quota vendor stays silent by default^{"rules":[{"when":"malformed upstream","use":[{"harness":"pi","model":"glm-5.2","effort":"high","vendor":"ollama:"}],"select":"quota-balanced"}]}^empty^
 unmapped quota-balanced candidate stays silent by default^{"rules":[{"when":"unknown upstream","use":[{"harness":"pi","model":"openai-codex/gpt-5.6-sol","effort":"max"},{"harness":"codex","model":"gpt-5.5","effort":"high"}],"select":"quota-balanced"}]}^empty^
 unknown explicit quota vendor stays silent by default^{"rules":[{"when":"unknown explicit upstream","use":[{"harness":"pi","model":"glm-5.2","effort":"high","vendor":"pi"}],"select":"quota-balanced"}]}^empty^
 array use without select is accepted^{"rules":[{"when":"big feature","use":[{"harness":"claude"},{"harness":"codex"}]}]}^empty^

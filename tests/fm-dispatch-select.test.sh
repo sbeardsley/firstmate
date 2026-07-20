@@ -186,6 +186,109 @@ test_explicit_vendor_override_wins_and_is_not_output() {
   pass "quota-balanced honors optional explicit vendor override without changing spawn profile output"
 }
 
+test_provider_qualified_vendor_selects_on_provider_prefix_only() {
+  local quota out profiles_qualified
+  profiles_qualified='[{"harness":"pi","model":"glm-5.2","effort":"high","vendor":"ollama:glm-5.2:cloud"},{"harness":"codex","model":"gpt-5.5","effort":"high"}]'
+  quota="$TMP_ROOT/qualified-vendor.json"
+  write_ollama_codex_quota "$quota" fresh 90 90 fresh 10 10
+
+  out=$("$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced --quota-json "$quota" "$profiles_qualified" 2>"$TMP_ROOT/qualified-vendor.err")
+  [ "$out" = '{"harness":"pi","model":"glm-5.2","effort":"high"}' ] \
+    || fail "provider-qualified vendor should resolve on its ollama prefix without leaking vendor, got: $out"
+  [ -z "$(cat "$TMP_ROOT/qualified-vendor.err")" ] \
+    || fail "a well-formed provider-qualified vendor should log nothing, got: $(cat "$TMP_ROOT/qualified-vendor.err")"
+  pass "a provider-qualified vendor selects on the provider prefix and keeps the opaque reference out of the spawn profile"
+}
+
+test_provider_qualified_vendor_ignores_the_opaque_suffix_for_windows() {
+  local quota out err profiles_qualified
+  profiles_qualified='[{"harness":"pi","model":"glm-5.2","effort":"high","vendor":"ollama:glm-5.2:cloud"},{"harness":"codex","model":"gpt-5.5","effort":"high"}]'
+  quota="$TMP_ROOT/qualified-model-window.json"
+  cat > "$quota" <<'JSON'
+{
+  "providers": [
+    {
+      "provider": "ollama",
+      "state": { "status": "fresh" },
+      "windows": [
+        { "id": "five_hour", "kind": "session", "percentRemaining": 90 },
+        { "id": "weekly", "kind": "weekly", "percentRemaining": 90 },
+        { "id": "model:glm-5.2:cloud", "kind": "model", "percentRemaining": 1 }
+      ]
+    },
+    {
+      "provider": "codex",
+      "state": { "status": "fresh" },
+      "windows": [
+        { "id": "five_hour", "kind": "session", "percentRemaining": 10 },
+        { "id": "weekly", "kind": "weekly", "percentRemaining": 10 }
+      ]
+    }
+  ]
+}
+JSON
+
+  out=$("$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced --quota-json "$quota" "$profiles_qualified" 2>"$TMP_ROOT/qualified-model-window.err")
+  err=$(cat "$TMP_ROOT/qualified-model-window.err")
+  [ "$out" = '{"harness":"pi","model":"glm-5.2","effort":"high"}' ] \
+    || fail "an exhausted model-scoped window must not be read as this candidate's quota, got: $out"
+  [ -z "$err" ] || fail "account-level selection should stay quiet, got: $err"
+  pass "the opaque upstream reference never becomes a quota key while Ollama quota is account-level"
+}
+
+test_malformed_vendor_is_reported_and_non_blocking() {
+  local quota out err status profiles_malformed
+  profiles_malformed='[{"harness":"pi","model":"glm-5.2","effort":"high","vendor":"ollama:"},{"harness":"codex","model":"gpt-5.5","effort":"high"}]'
+  quota="$TMP_ROOT/malformed-vendor.json"
+  write_ollama_codex_quota "$quota" fresh 90 90 fresh 10 10
+
+  out=$("$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced --quota-json "$quota" "$profiles_malformed" 2>"$TMP_ROOT/malformed-vendor.err")
+  status=$?
+  err=$(cat "$TMP_ROOT/malformed-vendor.err")
+  expect_code 0 "$status" "a malformed vendor must not block dispatch"
+  [ "$out" = '{"harness":"codex","model":"gpt-5.5","effort":"high"}' ] \
+    || fail "malformed vendor should be excluded rather than silently trusted, got: $out"
+  assert_contains "$err" "candidate 0 (pi/glm-5.2) declares malformed quota vendor \"ollama:\"" \
+    "a malformed vendor should be reported, not silently dropped"
+  pass "a malformed vendor value is excluded with a reported reason and never blocks dispatch"
+}
+
+test_unknown_provider_prefix_is_reported_with_its_reference() {
+  local quota out err profiles_unknown
+  profiles_unknown='[{"harness":"grok","model":"grok-4","effort":"high","vendor":"grok:grok-4"},{"harness":"codex","model":"gpt-5.5","effort":"high"}]'
+  quota="$TMP_ROOT/unknown-provider.json"
+  cat > "$quota" <<'JSON'
+{
+  "providers": [
+    {
+      "provider": "grok",
+      "state": { "status": "fresh" },
+      "windows": [
+        { "id": "five_hour", "kind": "session", "percentRemaining": 95 },
+        { "id": "seven_day", "kind": "weekly", "percentRemaining": 95 }
+      ]
+    },
+    {
+      "provider": "codex",
+      "state": { "status": "fresh" },
+      "windows": [
+        { "id": "five_hour", "kind": "session", "percentRemaining": 10 },
+        { "id": "weekly", "kind": "weekly", "percentRemaining": 10 }
+      ]
+    }
+  ]
+}
+JSON
+
+  out=$("$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced --quota-json "$quota" "$profiles_unknown" 2>"$TMP_ROOT/unknown-provider.err")
+  err=$(cat "$TMP_ROOT/unknown-provider.err")
+  [ "$out" = '{"harness":"codex","model":"gpt-5.5","effort":"high"}' ] \
+    || fail "an unmapped provider must stay excluded even when quota-axi reports it, got: $out"
+  assert_contains "$err" "candidate 0 (grok/grok-4) declares unknown quota vendor \"grok:grok-4\" (quota provider \"grok\", upstream model reference \"grok-4\")" \
+    "an unknown provider should be reported with its parsed provider and opaque reference"
+  pass "an explicit vendor cannot enroll an unmapped provider, even one quota-axi reports"
+}
+
 test_quota_missing_falls_back_to_first() {
   local fakebin out err status
   fakebin=$(fm_fakebin "$TMP_ROOT/missing")
@@ -348,17 +451,33 @@ test_no_usable_candidates_falls_back_to_first_mapped_profile() {
   pass "no usable quota windows prefers a known vendor candidate before an unmapped first profile"
 }
 
-test_quota_vendor_diagnostics() {
+test_quota_vendor_facts() {
   local out config
   config='{"rules":[{"when":"big work","use":[{"harness":"pi","model":"openai-codex/gpt-5.6-sol"},{"harness":"pi","model":"glm-5.2-cloud"},{"harness":"opencode","model":"anthropic/claude-sonnet-4-5","vendor":"mystery"}],"select":"quota-balanced"},{"when":"normal","use":[{"harness":"pi","model":"openai-codex/gpt-5.6-sol"}]}]}'
-  out=$("$ROOT/bin/fm-dispatch-select.sh" --quota-vendor-diagnostics "$config")
+  out=$("$ROOT/bin/fm-dispatch-select.sh" --quota-vendor-facts "$config")
 
   assert_contains "$out" "BOOTSTRAP_INFO: quota-balanced candidate pi/openai-codex/gpt-5.6-sol has no known quota vendor" \
-    "diagnostics should surface unmapped quota-balanced candidates"
+    "facts should surface unmapped quota-balanced candidates"
   assert_contains "$out" "BOOTSTRAP_INFO: quota-balanced candidate opencode/anthropic/claude-sonnet-4-5 declares unknown quota vendor \"mystery\"" \
-    "diagnostics should surface unknown explicit vendors"
-  assert_not_contains "$out" "pi/glm-5.2-cloud" "diagnostics should not warn for mapped pi cloud models"
-  pass "quota vendor diagnostics reports only quota-balanced profiles without known vendors"
+    "facts should surface unknown explicit vendors"
+  assert_not_contains "$out" "pi/glm-5.2-cloud" "facts should not warn for mapped pi cloud models"
+  pass "quota vendor facts report only quota-balanced profiles without known vendors"
+}
+
+test_quota_vendor_facts_surface_the_qualified_grammar() {
+  local out config
+  config='{"rules":[{"when":"qualified","use":[{"harness":"pi","model":"glm-5.2","vendor":"ollama:glm-5.2:cloud"},{"harness":"pi","model":"a","vendor":"ollama:"},{"harness":"pi","model":"b","vendor":":glm-5.2"},{"harness":"pi","model":"c","vendor":"grok:grok-4"}],"select":"quota-balanced"}]}'
+  out=$("$ROOT/bin/fm-dispatch-select.sh" --quota-vendor-facts "$config")
+
+  assert_not_contains "$out" "candidate pi/glm-5.2 " \
+    "a well-formed provider-qualified vendor needs no fact"
+  assert_contains "$out" "candidate pi/a declares malformed quota vendor \"ollama:\"" \
+    "an empty upstream model reference should be reported as malformed"
+  assert_contains "$out" "candidate pi/b declares malformed quota vendor \":glm-5.2\"" \
+    "an empty provider prefix should be reported as malformed"
+  assert_contains "$out" "candidate pi/c declares unknown quota vendor \"grok:grok-4\" (quota provider \"grok\", upstream model reference \"grok-4\")" \
+    "an unknown provider should be reported with its parsed provider and opaque reference"
+  pass "quota vendor facts distinguish malformed values from unknown providers and echo the opaque reference"
 }
 
 test_backward_compatible_first_selection() {
@@ -391,6 +510,10 @@ test_pi_cloud_uses_ollama_vendor
 test_pi_cloud_is_excluded_without_ollama_capable_quota_axi
 test_ollama_general_windows_match_the_assumed_provider_shape
 test_explicit_vendor_override_wins_and_is_not_output
+test_provider_qualified_vendor_selects_on_provider_prefix_only
+test_provider_qualified_vendor_ignores_the_opaque_suffix_for_windows
+test_malformed_vendor_is_reported_and_non_blocking
+test_unknown_provider_prefix_is_reported_with_its_reference
 test_quota_missing_falls_back_to_first
 test_quota_error_falls_back_to_first
 test_quota_trouble_prefers_first_mapped_profile
@@ -400,7 +523,8 @@ test_stale_with_cache_needs_clear_margin_to_beat_fresh
 test_vendor_absent_or_unusable_falls_back_conservatively
 test_unmapped_and_absent_candidates_are_logged_and_excluded
 test_no_usable_candidates_falls_back_to_first_mapped_profile
-test_quota_vendor_diagnostics
+test_quota_vendor_facts
+test_quota_vendor_facts_surface_the_qualified_grammar
 test_backward_compatible_first_selection
 
 echo "# all fm-dispatch-select tests passed"

@@ -213,6 +213,10 @@ Per rule, `when` and `use` are required.
 `use.model`, `use.effort`, and `why` are optional.
 `use.vendor` is optional and applies only to selector strategies that consult quota data.
 When present, it explicitly names the quota vendor for that profile without changing the concrete harness, model, or effort passed to `fm-spawn.sh`.
+Its value is either a bare quota provider such as `"ollama"`, or a provider-qualified upstream model reference such as `"ollama:glm-5.2:cloud"`.
+Only the first colon separates: the prefix is the quota provider and the whole remainder is one opaque upstream model reference the selector never interprets, so a reference may itself contain colons.
+A value with an empty prefix (`":glm-5.2"`) or an empty remainder (`"ollama:"`) is malformed and that candidate is excluded from quota comparison with a reported reason.
+Ollama quota is account-level today, so only the provider prefix selects quota windows; the remainder is preserved in configuration and echoed in diagnostics for future model-scoped support, never treated as a quota key.
 `select` is optional and currently supports `quota-balanced`.
 Absent `select` means use the first array element, or the only object in the single-object form; the first array element is the deterministic tie-break and the ultimate fallback.
 `default` is optional.
@@ -221,7 +225,11 @@ If a selected profile carries an effort value the chosen harness does not accept
 `quota-balanced` selection is deterministic and implemented by `bin/fm-dispatch-select.sh`, whose header owns the `(harness, model) -> quota vendor` mapping, the optional `use.vendor` override, the general-window rules, the 20 point stale-clear freshness margin, vendor-availability handling, and the non-blocking fallback semantics.
 For existing configs without `use.vendor`, Claude and Codex profiles map to their same-named quota vendors, while Pi models ending in `-cloud` map to the Ollama quota vendor.
 There is no generic Pi quota vendor because Pi is a worker tool, not a quota owner.
-A harness is mapped only once its general-window ids are verified against real `quota-axi` output, because an unverified window id silently excludes every candidate for that vendor rather than failing loudly; unmapped harnesses use `use.vendor` until their windows are confirmed.
+A harness is mapped only once its general-window ids are verified against real `quota-axi` output, because an unverified window id silently excludes every candidate for that vendor rather than failing loudly.
+Grok is deferred on exactly that basis: its provider reports `auth_required` with zero windows, so its general-window ids are unconfirmed and a guess would exclude every Grok candidate silently.
+`use.vendor` redirects a profile to one of the mapped providers above; it is not an escape hatch for an unmapped one.
+A provider with no verified window ids has no windows to compare, so naming it explicitly excludes the candidate with a reported `declares unknown quota vendor` reason rather than quietly enrolling it.
+Mapping a new provider therefore means adding it to the selector's vendor table together with its verified general-window ids, not setting `use.vendor` in a config.
 The Ollama mapping is staged ahead of its provider: `quota-axi` currently reports `claude`, `codex`, `cursor`, `copilot`, and `grok`, so a Pi `-cloud` candidate today resolves to vendor `ollama`, finds no such provider, and is excluded from quota comparison while dispatch continues through the remaining candidates.
 It only begins to influence selection once `quota-axi` reports an `ollama` provider carrying `five_hour` and `weekly` general windows, which is the provider shape the selector assumes.
 Quota trouble never blocks dispatch; when quota data is missing, stale beyond usefulness, malformed, unavailable, or yields no usable candidate, the selector logs the reason and chooses the first profile with a known quota vendor before falling back to the first array element.

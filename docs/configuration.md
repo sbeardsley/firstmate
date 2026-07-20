@@ -236,7 +236,7 @@ Quota trouble never blocks dispatch; when quota data is missing, stale beyond us
 Per-dispatch exclusions are always logged to stderr, while the equivalent static config facts are reported only under `FM_BOOTSTRAP_VERBOSE_FACTS=1` as `BOOTSTRAP_INFO:` lines, so an inherited secondmate home missing credentials never becomes a recurring startup diagnostic.
 See [`docs/examples/crew-dispatch.json`](examples/crew-dispatch.json) for a starting point to copy into local `config/crew-dispatch.json`.
 When the file exists, bootstrap validates it with `jq`.
-Valid files stay silent by default; with `FM_BOOTSTRAP_VERBOSE_FACTS=1`, bootstrap emits `BOOTSTRAP_INFO: crew dispatch active config/crew-dispatch.json` plus one `BOOTSTRAP_INFO:` fact per rule and default profile.
+Valid files stay silent by default; with `FM_BOOTSTRAP_VERBOSE_FACTS=1`, bootstrap emits `BOOTSTRAP_INFO: crew dispatch active config/crew-dispatch.json`, one `BOOTSTRAP_INFO:` fact per rule and default profile, and the quota-vendor facts described above for `quota-balanced` candidates.
 Malformed JSON, an unverified harness, a malformed array profile, an unknown `select`, or an effort value unsupported by that harness is reported as `CREW_DISPATCH: invalid config/crew-dispatch.json - ...`; missing `jq` is reported through the normal `MISSING: jq` install-consent flow.
 If no dispatch rule fits, firstmate uses the dispatch profile `default` when present, then falls back to `config/crew-harness`.
 Because the spawn backstop is gated by file presence, any fallback path after a missing match, validation error, or missing `jq` still passes a resolved harness explicitly until the file is fixed or removed.

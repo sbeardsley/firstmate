@@ -10,7 +10,8 @@
  * supervisor already monitors for wake events. It does NOT restart the agent.
  * Its only active intervention is an optional, best-effort turn abort /
  * tool block (gated behind the FM_LOOP_BLOCK env var; notification-only by
- * default).
+ * default), plus the session-scoped tool ban, which blocks by default
+ * independently of FM_LOOP_BLOCK (disable with FM_LOOP_BAN=0).
  *
  * The loop kinds and the supervisor action each requests:
  *   - prose     -> short block of sentences/lines repeating consecutively
@@ -24,11 +25,15 @@
  *                   -> supervisor relaunches the worker in a fresh session
  *   - tool-seq   -> identical tool-call sequence repeats >= threshold times
  *                   -> supervisor relaunches; the offending call is session-banned
- *   - file-scan  -> same absolute path read > FILE_SCAN_LIMIT times across all
- *                   line ranges
+ *                   (attempts to re-run a banned call also emit this kind)
+ *   - rederive   -> a context event carried thinking that re-derives the plan
+ *                   that led to a stagnation hit; the thinking parts are trimmed
+ *                   -> informational; no supervisor action requested
+ *   - file-scan  -> same absolute path read > FILE_SCAN_LIMIT times (counts
+ *                   halve each turn and reset when the file is written/edited)
  *                   -> supervisor relaunches; the offending call is blocked
  *   - search-spiral -> same search pattern repeated across > SEARCH_EXPAND_LIMIT
- *                      distinct locations
+ *                      distinct locations within a single turn
  *                   -> supervisor relaunches; the offending call is blocked
  *
  * Environment contract:
@@ -109,8 +114,8 @@ const FM_LOOP_BAN_DEFAULT = 1; // 1 = session ban on; 0 = ban off
 
 // --- file scan / search spiral ---------------------------------------------
 
-const FILE_SCAN_LIMIT = 20; // total reads of the same absolute path across all line ranges
-const SEARCH_EXPAND_LIMIT = 3; // distinct locations a single search pattern covers before spiral
+const FILE_SCAN_LIMIT = 20; // reads of the same absolute path (counts halve each turn, reset on write/edit)
+const SEARCH_EXPAND_LIMIT = 8; // distinct locations a single search pattern covers within one turn before spiral
 
 const DETAILS_MAX_CHARS = 160; // hard cap on the <details> portion of the line
 
@@ -204,7 +209,7 @@ function segmentsEqual(a: string, b: string): boolean {
 function blockEquals(segs: string[], i: number, j: number, b: number): boolean {
   for (let k = 0; k < b; k++) {
     if (i + k >= segs.length || j + k >= segs.length) return false;
-    if (!segmentsEqual(segs[i + k], segs[j + k])!) return false;
+    if (!segmentsEqual(segs[i + k], segs[j + k])) return false;
   }
   return true;
 }
@@ -517,12 +522,24 @@ export default function (pi: any) {
   pi.on("turn_start", () => {
     try {
       resetTurn();
+      // Decay file-read counts each turn so occasional legitimate re-reads
+      // never accumulate into a permanent block; only sustained scanning
+      // faster than the decay trips FILE_SCAN_LIMIT.
+      for (const [path, count] of fileReads) {
+        const next = Math.floor(count / 2);
+        if (next <= 0) fileReads.delete(path);
+        else fileReads.set(path, next);
+      }
+      // Search-spiral detection is scoped to a single turn.
+      searchPaths.clear();
     } catch {
       /* ignore */
     }
   });
 
-  // --- tool_call: tool loop detection + sequence loop + session ban ----
+  // --- tool_call: tool loop + sequence loop + session ban + file-scan +
+  // search-spiral. A single handler so block returns never depend on how pi
+  // orders or combines multiple handlers for the same event.
   pi.on("tool_call", async (event: any, ctx: any) => {
     try {
       if (!statusPath) return;
@@ -532,7 +549,7 @@ export default function (pi: any) {
       // pi uses event.input for tool parameters; tolerate event.args too.
       const args = event?.input ?? event?.args ?? event?.arguments ?? undefined;
       const norm = normalizeArgs(args, TOOL_ARGS_MAX_CHARS);
-      const key = `${toolName}\x00${norm}`;
+      const key = toolCallKey(toolName, args);
 
       // Record in history for sequence detection.
       toolCallHistory.push(key);
@@ -540,9 +557,9 @@ export default function (pi: any) {
         toolCallHistory.shift();
       }
 
-      // --- session ban: always block regardless of FM_LOOP_BLOCK --------
+      // --- session ban: blocks regardless of FM_LOOP_BLOCK --------------
       if (bannedTools.has(key)) {
-        report("tool", `${toolName} session-banned`);
+        report("tool-seq", `${toolName} session-banned`);
         if (banEnabled) {
           return { block: true, reason: "loop: banned for this session" };
         }
@@ -564,7 +581,7 @@ export default function (pi: any) {
       );
       if (seqHit) {
         const argPreview = truncate(normalizeArgs(args, 80), 80);
-        report("tool", `${toolName} ${argPreview ? `"${argPreview}"` : "(no args)"} x${seqHit.count}`);
+        report("tool-seq", `${toolName} ${argPreview ? `"${argPreview}"` : "(no args)"} x${seqHit.count}`);
         // Add to session ban set.
         bannedTools.add(key);
         if (blockEnabled) {
@@ -576,6 +593,47 @@ export default function (pi: any) {
         report("tool", `${toolName} ${argPreview ? `"${argPreview}"` : "(no args)"} x${toolRun}`);
         if (blockEnabled) {
           return { block: true, reason: `loop: tool repeated x${toolRun}` };
+        }
+      }
+
+      const input = args && typeof args === "object" ? (args as any) : undefined;
+
+      // --- write/edit: a modified file is fresh content; reset its count -
+      if (input && (toolName === "write" || toolName === "edit")) {
+        const target =
+          input.filePath ?? input.path ?? input.file ?? input.target ?? undefined;
+        if (target) fileReads.delete(normalizeReadPath(target, cwd));
+      }
+
+      // --- file-scan: structured `read` calls only, not bash ------------
+      if (input && toolName === "read") {
+        const filePath =
+          input.filePath ?? input.path ?? input.file ?? input.target ?? undefined;
+        if (filePath) {
+          const total = trackFileRead(fileReads, filePath, cwd);
+          if (total > FILE_SCAN_LIMIT) {
+            report("file-scan", `${filePath} read ${total} times`);
+            if (blockEnabled) {
+              return { block: true, reason: `loop: file-scan ${filePath} read ${total} times` };
+            }
+          }
+        }
+      }
+
+      // --- search-spiral: structured `grep` calls only, not bash --------
+      if (input && toolName === "grep") {
+        const pattern =
+          input.pattern ?? input.query ?? input.search ?? input.term ?? undefined;
+        const location =
+          input.path ?? input.location ?? input.target ?? input.directory ?? undefined;
+        if (pattern && location) {
+          const distinct = trackSearch(searchPaths, pattern, location);
+          if (distinct > SEARCH_EXPAND_LIMIT) {
+            report("search-spiral", `${pattern} across ${distinct} locations`);
+            if (blockEnabled) {
+              return { block: true, reason: `loop: search-spiral ${pattern} across ${distinct} locations` };
+            }
+          }
         }
       }
     } catch {
@@ -756,75 +814,4 @@ export default function (pi: any) {
     }
   });
 
-  // --- read-style tool: file-scan detection -------------------------------
-  pi.on("tool_call", async (event: any, _ctx: any) => {
-    try {
-      if (!statusPath) return;
-      const toolName = event?.toolName ?? event?.name ?? "";
-      if (toolName !== "read") return;
-      // Only count structured `read` calls, not bash.
-      const input = event?.input ?? event?.args ?? event?.arguments ?? undefined;
-      // input is typically { filePath: "...", offset?, limit? } or similar.
-      let filePath: string | undefined;
-      if (input && typeof input === "object") {
-        filePath =
-          (input as any).filePath ??
-          (input as any).path ??
-          (input as any).file ??
-          (input as any).target ??
-          undefined;
-      }
-      if (!filePath) return;
-      const total = trackFileRead(fileReads, filePath, cwd);
-      if (total > FILE_SCAN_LIMIT) {
-        report("file-scan", `${filePath} read ${total} times`);
-        if (blockEnabled) {
-          return { block: true, reason: `loop: file-scan ${filePath} read ${total} times` };
-        }
-      }
-    } catch {
-      /* never propagate */
-    }
-    // Return undefined so the existing tool_call handler above also runs;
-    // pi's extension model lets multiple handlers fire on the same event.
-    return undefined;
-  });
-
-  // --- search-style tool: search-spiral detection -------------------------
-  pi.on("tool_call", async (event: any, _ctx: any) => {
-    try {
-      if (!statusPath) return;
-      const toolName = event?.toolName ?? event?.name ?? "";
-      if (toolName !== "grep") return;
-      // Only count structured `grep` calls, not bash.
-      const input = event?.input ?? event?.args ?? event?.arguments ?? undefined;
-      let pattern: string | undefined;
-      let location: string | undefined;
-      if (input && typeof input === "object") {
-        pattern =
-          (input as any).pattern ??
-          (input as any).query ??
-          (input as any).search ??
-          (input as any).term ??
-          undefined;
-        location =
-          (input as any).path ??
-          (input as any).location ??
-          (input as any).target ??
-          (input as any).directory ??
-          undefined;
-      }
-      if (!pattern || !location) return;
-      const distinct = trackSearch(searchPaths, pattern, location);
-      if (distinct > SEARCH_EXPAND_LIMIT) {
-        report("search-spiral", `${pattern} across ${distinct} locations`);
-        if (blockEnabled) {
-          return { block: true, reason: `loop: search-spiral ${pattern} across ${distinct} locations` };
-        }
-      }
-    } catch {
-      /* never propagate */
-    }
-    return undefined;
-  });
 }

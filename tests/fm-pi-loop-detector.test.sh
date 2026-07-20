@@ -36,11 +36,13 @@ build_helper_test() {
   local helper="$1"
   local assertions="$2"
   local tmp
-  tmp="$(mktemp "${TMPDIR:-/tmp}/fm-pi-loop-test-$$.XXXXXX.mjs")"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/fm-pi-loop-test.XXXXXX")"
   if [ ! -f "$tmp" ]; then
     echo "ERROR: mktemp failed, tmp=$tmp" >&2
     return 1
   fi
+  mv "$tmp" "$tmp.mjs"
+  tmp="$tmp.mjs"
   {
     echo 'import { pathToFileURL } from "node:url";'
     echo "const m = await import(pathToFileURL(\"${ROOT}/pi-extensions/firstmate-pi-loop.ts\").href);"

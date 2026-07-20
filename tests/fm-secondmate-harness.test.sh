@@ -149,11 +149,11 @@ test_propagate_lib() {
   [ "$m1" = "$m2" ] || fail "idempotent re-run churned mtime ($m1 -> $m2)"
 
   # 3. a changed source value converges downstream
-  printf '{"default":{"harness":"claude"}}\n' > "$src/crew-dispatch.json"
+  printf '{"rules":[{"when":"glm","use":[{"harness":"pi","model":"glm-5.2","vendor":"ollama"}],"select":"quota-balanced"}],"default":{"harness":"claude"}}\n' > "$src/crew-dispatch.json"
   printf 'claude\n' > "$src/crew-harness"
   printf 'tasks-axi\n' > "$src/backlog-backend"
   propagate_inheritable_config "$src" "$dest"
-  [ "$(cat "$dest/crew-dispatch.json")" = '{"default":{"harness":"claude"}}' ] || fail "changed dispatch profile did not converge"
+  [ "$(cat "$dest/crew-dispatch.json")" = '{"rules":[{"when":"glm","use":[{"harness":"pi","model":"glm-5.2","vendor":"ollama"}],"select":"quota-balanced"}],"default":{"harness":"claude"}}' ] || fail "changed dispatch profile did not converge"
   [ "$(cat "$dest/crew-harness")" = claude ] || fail "changed value did not converge"
   [ "$(cat "$dest/backlog-backend")" = tasks-axi ] || fail "changed backlog backend did not converge"
 

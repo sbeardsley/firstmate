@@ -198,7 +198,7 @@ This section is the single owner of the canonical schema and its per-field seman
     {
       "when": "<natural-language condition describing a kind of task>",
       "use": [
-        { "harness": "<adapter>", "model": "<optional model>", "effort": "<low|medium|high|xhigh|max, optional>" }
+        { "harness": "<adapter>", "model": "<optional model>", "effort": "<low|medium|high|xhigh|max, optional>", "vendor": "<optional quota vendor>" }
       ],
       "select": "<optional strategy>",
       "why": "<optional rationale that helps firstmate choose>"
@@ -211,12 +211,18 @@ This section is the single owner of the canonical schema and its per-field seman
 Per rule, `when` and `use` are required.
 `use` may be a single profile object or an ordered array of profile objects; the single-object form stays fully backward-compatible, and every profile needs `harness`.
 `use.model`, `use.effort`, and `why` are optional.
+`use.vendor` is optional and applies only to selector strategies that consult quota data.
+When present, it explicitly names the quota vendor for that profile without changing the concrete harness, model, or effort passed to `fm-spawn.sh`.
 `select` is optional and currently supports `quota-balanced`.
 Absent `select` means use the first array element, or the only object in the single-object form; the first array element is the deterministic tie-break and the ultimate fallback.
 `default` is optional.
 An omitted model or effort means the selected harness uses its own default for that axis.
 If a selected profile carries an effort value the chosen harness does not accept, `fm-spawn.sh` records the requested `effort=` in task meta for traceability but omits the launch flag, and bootstrap reports the invalid harness/effort pair as a `CREW_DISPATCH` diagnostic when it is visible in the file.
-`quota-balanced` selection is deterministic and implemented by `bin/fm-dispatch-select.sh`, whose header owns the general-window rules, the 20 point stale-clear freshness margin, vendor-availability handling, and the degrade-to-first-element fallbacks; quota trouble never blocks dispatch.
+`quota-balanced` selection is deterministic and implemented by `bin/fm-dispatch-select.sh`, whose header owns the `(harness, model) -> quota vendor` mapping, the optional `use.vendor` override, the general-window rules, the 20 point stale-clear freshness margin, vendor-availability handling, and the non-blocking fallback semantics.
+For existing configs without `use.vendor`, Claude, Codex, and Grok profiles map to their same-named quota vendors, while Pi models ending in `-cloud` map to the Ollama quota vendor.
+There is no generic Pi quota vendor because Pi is a worker tool, not a quota owner.
+Quota trouble never blocks dispatch; when quota data is missing, stale beyond usefulness, malformed, unavailable, or yields no usable candidate, the selector logs the reason and chooses the first profile with a known quota vendor before falling back to the first array element.
+Bootstrap also reports non-fatal `CREW_DISPATCH:` advisories for `quota-balanced` candidates with no known quota vendor or an unknown explicit vendor, so inherited secondmate homes without credentials are not treated as broken merely because quota data is unavailable.
 See [`docs/examples/crew-dispatch.json`](examples/crew-dispatch.json) for a starting point to copy into local `config/crew-dispatch.json`.
 When the file exists, bootstrap validates it with `jq`.
 Valid files stay silent by default; with `FM_BOOTSTRAP_VERBOSE_FACTS=1`, bootstrap emits `BOOTSTRAP_INFO: crew dispatch active config/crew-dispatch.json` plus one `BOOTSTRAP_INFO:` fact per rule and default profile.

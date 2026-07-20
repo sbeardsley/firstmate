@@ -9,6 +9,7 @@
 #                 "MISSING_MANUAL: <tool> (instructions: <url>)", "NEEDS_GH_AUTH",
 #                 "BACKEND_INVALID: <name> (known: <names>)",
 #                 "CREW_DISPATCH: invalid config/crew-dispatch.json - <reason>",
+#                 "CREW_DISPATCH: quota-balanced candidate <profile> ...",
 #                 "FLEET_SYNC: <repo>: skipped|recovered|STUCK: <detail>",
 #                 "PR_CHECK_MIGRATION: <private remediation>",
 #                 "TANGLE: <remediation>",
@@ -707,6 +708,7 @@ crew_dispatch_validate() {
     echo "CREW_DISPATCH: invalid config/crew-dispatch.json - $err"
     return 0
   fi
+  "$SCRIPT_DIR/fm-dispatch-select.sh" --quota-vendor-diagnostics < "$file" || true
   if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ]; then
     jq -r '
     def profile($p):

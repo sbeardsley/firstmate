@@ -105,11 +105,11 @@ JQ_VENDOR_LIB='
     (explicit_vendor($p) // inferred_vendor($p)) as $v
     | if $v == null then null
       else
-        ($v | index(":")) as $i
-        | if $i == null then {raw: $v, provider: $v, ref: null, malformed: false}
+        ($v | split(":")) as $parts
+        | if ($parts | length) == 1 then {raw: $v, provider: $v, ref: null, malformed: false}
           else
-            ($v[0:$i]) as $prefix
-            | ($v[$i + 1:]) as $suffix
+            ($parts[0]) as $prefix
+            | ($parts[1:] | join(":")) as $suffix
             | {
                 raw: $v,
                 provider: $prefix,

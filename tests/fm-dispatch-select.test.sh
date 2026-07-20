@@ -480,6 +480,22 @@ test_quota_vendor_facts_surface_the_qualified_grammar() {
   pass "quota vendor facts distinguish malformed values from unknown providers and echo the opaque reference"
 }
 
+test_qualified_vendor_splits_on_codepoints_not_bytes() {
+  local out config
+  config='{"rules":[{"when":"non-ascii","use":[{"harness":"pi","model":"d","vendor":"olläma:glm-5.2"},{"harness":"pi","model":"e","vendor":"ollama:glm-5.2:naïve"},{"harness":"pi","model":"f","vendor":"olläma:"}],"select":"quota-balanced"}]}'
+  out=$("$ROOT/bin/fm-dispatch-select.sh" --quota-vendor-facts "$config")
+
+  assert_contains "$out" "candidate pi/d declares unknown quota vendor \"olläma:glm-5.2\" (quota provider \"olläma\", upstream model reference \"glm-5.2\")" \
+    "a multi-byte provider prefix should split at the colon, not a byte offset inside it"
+  assert_not_contains "$out" "candidate pi/d declares malformed" \
+    "a well-formed value with a multi-byte provider must not be misreported as malformed"
+  assert_not_contains "$out" "candidate pi/e" \
+    "a multi-byte upstream model reference stays opaque and well-formed under a known provider"
+  assert_contains "$out" "candidate pi/f declares malformed quota vendor \"olläma:\"" \
+    "a genuinely empty reference stays malformed even with a multi-byte prefix"
+  pass "provider-qualified vendors split by codepoint, so multi-byte prefixes classify correctly"
+}
+
 test_backward_compatible_first_selection() {
   local fakebin marker out single array_rule
   fakebin=$(fm_fakebin "$TMP_ROOT/no-call")
@@ -525,6 +541,7 @@ test_unmapped_and_absent_candidates_are_logged_and_excluded
 test_no_usable_candidates_falls_back_to_first_mapped_profile
 test_quota_vendor_facts
 test_quota_vendor_facts_surface_the_qualified_grammar
+test_qualified_vendor_splits_on_codepoints_not_bytes
 test_backward_compatible_first_selection
 
 echo "# all fm-dispatch-select tests passed"

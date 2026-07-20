@@ -2,7 +2,7 @@
  * firstmate-pi-loop
  *
  * A pi (pi-coding-agent) extension that detects when an LLM session has
- * degenerated into one of three kinds of loop and notifies an external
+ * degenerated into one of several kinds of loop and notifies an external
  * supervisor (Firstmate) so it can take the right recovery action.
  *
  * The extension is a passive sensor plus a one-line notification: it appends
@@ -10,9 +10,10 @@
  * supervisor already monitors for wake events. It does NOT restart the agent.
  * Its only active intervention is an optional, best-effort turn abort /
  * tool block (gated behind the FM_LOOP_BLOCK env var; notification-only by
- * default).
+ * default), plus the session-scoped tool ban, which blocks by default
+ * independently of FM_LOOP_BLOCK (disable with FM_LOOP_BAN=0).
  *
- * The three loop kinds and the supervisor action each requests:
+ * The loop kinds and the supervisor action each requests:
  *   - prose     -> short block of sentences/lines repeating consecutively
  *                  -> supervisor relaunches the worker in a fresh session
  *   - tool      -> same tool call (same tool + same normalized args) > 3x in a row
@@ -20,13 +21,31 @@
  *   - reasoning -> turn producing reasoning/thinking for too long with no
  *                  text output and no tool call
  *                  -> supervisor steers the agent to wrap up (no relaunch)
+ *   - stagnation -> cross-turn thinking re-derives the same plan across turns
+ *                   -> supervisor relaunches the worker in a fresh session
+ *   - tool-seq   -> identical tool-call sequence repeats >= threshold times
+ *                   -> supervisor relaunches; the offending call is session-banned
+ *                   (attempts to re-run a banned call also emit this kind)
+ *   - rederive   -> a context event carried thinking that re-derives the plan
+ *                   that led to a stagnation hit; the thinking parts are trimmed
+ *                   -> informational; no supervisor action requested
+ *   - file-scan  -> same absolute path read > FILE_SCAN_LIMIT times (counts
+ *                   halve each turn and reset when the file is written/edited)
+ *                   -> supervisor relaunches; the offending call is blocked
+ *   - search-spiral -> same search pattern repeated across > SEARCH_EXPAND_LIMIT
+ *                      distinct locations within a single turn
+ *                   -> supervisor relaunches; the offending call is blocked
  *
  * Environment contract:
  *   FM_HOME    - absolute path to the supervisor's home directory.
  *   FM_TASK_ID - the task identifier string.
  *   Status path: ${FM_HOME}/state/${FM_TASK_ID}.status
  *   FM_LOOP_BLOCK - optional; set to "1" or "true" to enable best-effort
- *                   abort (prose/reasoning) / block (tool) after notifying.
+ *                   abort (prose/reasoning/stagnation) / block (tool/file-scan/search-spiral)
+ *                   after notifying.
+ *   FM_LOOP_BAN - optional; set to "0" to disable the session-scoped tool-ban
+ *                 (the per-occurrence block under FM_LOOP_BLOCK still fires).
+ *                 Default: on.
  *
  * If FM_HOME or FM_TASK_ID is unset, the extension is a silent no-op, which
  * makes it safe to load in any pi session (including the supervisor's own
@@ -43,9 +62,11 @@
  *   - tool call     -> { type: "toolCall", id, name, arguments }
  *
  * Abort/block API discovered and used (only when FM_LOOP_BLOCK is set):
- *   - prose / reasoning mid-stream: `ctx.abort()` (cancels the current turn).
+ *   - prose / reasoning / stagnation mid-stream: `ctx.abort()` (cancels the current turn).
  *   - tool on the offending repeated call: `tool_call` handler returns
  *     `{ block: true, reason }`.
+ *   - session-banned tool: `tool_call` handler returns `{ block: true, reason }`
+ *     regardless of FM_LOOP_BLOCK.
  *
  * Reasoning re-report cadence:
  *   The prose and tool detectors fire once per turn (each is a discrete event
@@ -57,7 +78,7 @@
  */
 
 import { appendFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 // ===========================================================================
 // Tunables
@@ -76,6 +97,25 @@ const REASONING_TIMEOUT_SECS = 90;
 const REASONING_MAX_CHARS = 12000;
 
 const REASONING_REREPORT_SECS = 60; // cadence for re-emitting reasoning loop lines
+
+// --- stagnation / re-derive ------------------------------------------------
+
+const STAGNATION_WINDOW = 4; // number of prior turns' fingerprint sets to compare against
+const STAGNATION_THRESHOLD = 0.85; // Jaccard similarity >= this triggers the stagnation line
+const REDERIVE_THRESHOLD = 0.85; // Jaccard similarity >= this triggers re-derive trim
+const FINGERPRINT_LEN = 60; // per-paragraph fingerprint: first N alnum-normalized chars
+const REDERIVE_RESET_EVENTS = 5; // after N context events post-trim, reset the led-to-loop set
+
+// --- tool sequence / session ban -------------------------------------------
+
+const TOOL_SEQ_WINDOW = 3; // size of the sliding window of consecutive tool calls
+const TOOL_SEQ_REPEAT_THRESHOLD = 3; // identical W-window repeats >= this triggers the line
+const FM_LOOP_BAN_DEFAULT = 1; // 1 = session ban on; 0 = ban off
+
+// --- file scan / search spiral ---------------------------------------------
+
+const FILE_SCAN_LIMIT = 20; // reads of the same absolute path (counts halve each turn, reset on write/edit)
+const SEARCH_EXPAND_LIMIT = 8; // distinct locations a single search pattern covers within one turn before spiral
 
 const DETAILS_MAX_CHARS = 160; // hard cap on the <details> portion of the line
 
@@ -220,6 +260,156 @@ export function detectProse(text: string): ProseHit | null {
   return best;
 }
 
+// --- stagnation / re-derive ------------------------------------------------
+
+/**
+ * Split a string into paragraphs (blank-line or sentence boundaries), then
+ * produce a per-paragraph fingerprint: each paragraph is normalized (lowercased,
+ * stripped of non-alnum, trimmed) and truncated to FINGERPRINT_LEN chars.
+ * Returns the set of per-paragraph fingerprints.
+ */
+export function paragraphFingerprints(text: string): Set<string> {
+  const out = new Set<string>();
+  // Split on blank lines first, then on sentence boundaries within each chunk.
+  const chunks = text.split(/\n\s*\n/);
+  for (const chunk of chunks) {
+    const sentences = chunk.split(/(?<=[.!?])\s+/);
+    for (const sent of sentences) {
+      const normalized = sent.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+      if (!normalized) continue;
+      out.add(normalized.slice(0, FINGERPRINT_LEN));
+    }
+  }
+  return out;
+}
+
+/**
+ * Concatenate all `type === "thinking"` content parts of an assistant message
+ * into a single string.
+ */
+export function extractAssistantThinking(message: any): string {
+  if (!message || !Array.isArray(message.content)) return "";
+  let out = "";
+  for (const part of message.content) {
+    if (part && part.type === "thinking" && typeof part.thinking === "string") {
+      out += part.thinking;
+    }
+  }
+  return out;
+}
+
+/**
+ * Jaccard similarity between two sets: |intersection| / |union|.
+ * Returns 0 when both sets are empty, otherwise returns a value in [0, 1].
+ */
+export function jaccardSimilarity(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 && b.size === 0) return 0;
+  let intersection = 0;
+  for (const item of a) {
+    if (b.has(item)) intersection++;
+  }
+  const union = a.size + b.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+}
+
+/**
+ * Compute the union of a list of fingerprint sets.
+ */
+export function unionOfSets(sets: Set<string>[]): Set<string> {
+  const out = new Set<string>();
+  for (const s of sets) {
+    for (const item of s) out.add(item);
+  }
+  return out;
+}
+
+// --- tool sequence ---------------------------------------------------------
+
+/**
+ * Build a key from a tool call: toolName + normalized args.
+ */
+export function toolCallKey(toolName: string, args: unknown): string {
+  return `${toolName}\x00${normalizeArgs(args, TOOL_ARGS_MAX_CHARS)}`;
+}
+
+/**
+ * Detect a repeating tool-call sequence: given a history of tool call keys
+ * (ordered by time), check whether the last `windowSize` calls repeat
+ * identically >= `repeatThreshold` times consecutively.
+ *
+ * Returns the detected run info or null if no sequence loop is found.
+ */
+export function detectToolSequence(
+  history: string[],
+  windowSize: number,
+  repeatThreshold: number,
+): { key: string; count: number } | null {
+  if (history.length < windowSize) return null;
+  const tail = history.slice(-windowSize);
+  const key = tail.join(",");
+  // Walk backwards from the end, counting consecutive identical W-windows.
+  let count = 1;
+  let i = history.length - windowSize;
+  while (i - windowSize >= 0) {
+    const prev = history.slice(i - windowSize, i).join(",");
+    if (prev === key) {
+      count++;
+      i -= windowSize;
+    } else {
+      break;
+    }
+  }
+  if (count >= repeatThreshold) {
+    return { key, count };
+  }
+  return null;
+}
+
+// --- file scan -------------------------------------------------------------
+
+/**
+ * Normalize a read path to absolute form (resolve relative paths against the
+ * given cwd). Returns the absolute path string.
+ */
+export function normalizeReadPath(filePath: string, cwd: string): string {
+  if (!filePath) return "";
+  if (resolve(filePath) === filePath) return filePath;
+  return resolve(cwd, filePath);
+}
+
+/**
+ * Track a read call: increment the per-path count in the map.
+ * Returns the new total count for that path.
+ */
+export function trackFileRead(
+  fileReads: Map<string, number>,
+  filePath: string,
+  cwd: string,
+): number {
+  if (!filePath) return 0;
+  const abs = normalizeReadPath(filePath, cwd);
+  const n = (fileReads.get(abs) ?? 0) + 1;
+  fileReads.set(abs, n);
+  return n;
+}
+
+// --- search spiral ---------------------------------------------------------
+
+/**
+ * Track a search call: record the pattern and add the location to the pattern's
+ * set. Returns the current distinct-location count for that pattern.
+ */
+export function trackSearch(
+  searchPaths: Map<string, Set<string>>,
+  pattern: string,
+  location: string,
+): number {
+  const set = searchPaths.get(pattern) ?? new Set<string>();
+  set.add(location);
+  searchPaths.set(pattern, set);
+  return set.size;
+}
+
 // --- message extraction ----------------------------------------------------
 
 /** Concatenate all `type === "text"` content parts of an assistant message. */
@@ -270,6 +460,12 @@ export default function (pi: any) {
   const home = process.env.FM_HOME;
   const statusPath = taskId && home ? join(home, "state", `${taskId}.status`) : null;
   const blockEnabled = /^(1|true|yes)$/i.test(String(process.env.FM_LOOP_BLOCK ?? ""));
+  const banEnabled = String(process.env.FM_LOOP_BAN ?? "").length === 0
+    ? FM_LOOP_BAN_DEFAULT
+    : /^(1|true|yes)$/i.test(String(process.env.FM_LOOP_BAN ?? ""))
+      ? 1
+      : 0;
+  const cwd = process.cwd();
 
   // per-turn state
   let reportedKind: string | null = null;
@@ -280,6 +476,25 @@ export default function (pi: any) {
   let reasoningChars = 0;
   let lastToolKey: string | null = null;
   let toolRun = 0;
+
+  // --- stagnation / re-derive state --------------------------------------
+  // Each entry is the set of paragraph fingerprints for one turn's assistant
+  // thinking. We keep a sliding window of the last STAGNATION_WINDOW entries.
+  const stagnationWindow: Set<string>[] = [];
+  // The fingerprint set that led to the most recent stagnation detection;
+  // used to trim re-derived thinking on the next context event.
+  let ledToLoop: Set<string> | null = null;
+  let rederiveEventCount = 0;
+
+  // --- tool sequence / session ban state ---------------------------------
+  // Ordered history of tool-call keys (one per call).
+  const toolCallHistory: string[] = [];
+  // Session-scoped ban set: keys that proved they loop.
+  const bannedTools: Set<string> = new Set<string>();
+
+  // --- file scan / search spiral state -----------------------------------
+  const fileReads: Map<string, number> = new Map<string, number>();
+  const searchPaths: Map<string, Set<string>> = new Map<string, Set<string>>();
 
   const resetTurn = () => {
     reportedKind = null;
@@ -307,12 +522,24 @@ export default function (pi: any) {
   pi.on("turn_start", () => {
     try {
       resetTurn();
+      // Decay file-read counts each turn so occasional legitimate re-reads
+      // never accumulate into a permanent block; only sustained scanning
+      // faster than the decay trips FILE_SCAN_LIMIT.
+      for (const [path, count] of fileReads) {
+        const next = Math.floor(count / 2);
+        if (next <= 0) fileReads.delete(path);
+        else fileReads.set(path, next);
+      }
+      // Search-spiral detection is scoped to a single turn.
+      searchPaths.clear();
     } catch {
       /* ignore */
     }
   });
 
-  // --- tool_call: tool loop detection + optional block --------------------
+  // --- tool_call: tool loop + sequence loop + session ban + file-scan +
+  // search-spiral. A single handler so block returns never depend on how pi
+  // orders or combines multiple handlers for the same event.
   pi.on("tool_call", async (event: any, ctx: any) => {
     try {
       if (!statusPath) return;
@@ -322,8 +549,23 @@ export default function (pi: any) {
       // pi uses event.input for tool parameters; tolerate event.args too.
       const args = event?.input ?? event?.args ?? event?.arguments ?? undefined;
       const norm = normalizeArgs(args, TOOL_ARGS_MAX_CHARS);
-      const key = `${toolName}\x00${norm}`;
+      const key = toolCallKey(toolName, args);
 
+      // Record in history for sequence detection.
+      toolCallHistory.push(key);
+      if (toolCallHistory.length > TOOL_SEQ_WINDOW * TOOL_SEQ_REPEAT_THRESHOLD + 1) {
+        toolCallHistory.shift();
+      }
+
+      // --- session ban: blocks regardless of FM_LOOP_BLOCK --------------
+      if (bannedTools.has(key)) {
+        report("tool-seq", `${toolName} session-banned`);
+        if (banEnabled) {
+          return { block: true, reason: "loop: banned for this session" };
+        }
+      }
+
+      // --- per-call adjacency detector (existing) -----------------------
       if (key === lastToolKey) {
         toolRun += 1;
       } else {
@@ -331,12 +573,67 @@ export default function (pi: any) {
         toolRun = 1;
       }
 
-      if (toolRun > TOOL_REPEAT_THRESHOLD) {
+      // --- sequence detector: sliding window of identical calls ---------
+      const seqHit = detectToolSequence(
+        toolCallHistory,
+        TOOL_SEQ_WINDOW,
+        TOOL_SEQ_REPEAT_THRESHOLD,
+      );
+      if (seqHit) {
+        const argPreview = truncate(normalizeArgs(args, 80), 80);
+        report("tool-seq", `${toolName} ${argPreview ? `"${argPreview}"` : "(no args)"} x${seqHit.count}`);
+        // Add to session ban set.
+        bannedTools.add(key);
+        if (blockEnabled) {
+          return { block: true, reason: `loop: tool sequence repeated x${seqHit.count}` };
+        }
+      } else if (toolRun > TOOL_REPEAT_THRESHOLD) {
+        // --- single-call detector (existing) ----------------------------
         const argPreview = truncate(norm, 80);
         report("tool", `${toolName} ${argPreview ? `"${argPreview}"` : "(no args)"} x${toolRun}`);
         if (blockEnabled) {
-          // best-effort block of the offending repeated call
           return { block: true, reason: `loop: tool repeated x${toolRun}` };
+        }
+      }
+
+      const input = args && typeof args === "object" ? (args as any) : undefined;
+
+      // --- write/edit: a modified file is fresh content; reset its count -
+      if (input && (toolName === "write" || toolName === "edit")) {
+        const target =
+          input.filePath ?? input.path ?? input.file ?? input.target ?? undefined;
+        if (target) fileReads.delete(normalizeReadPath(target, cwd));
+      }
+
+      // --- file-scan: structured `read` calls only, not bash ------------
+      if (input && toolName === "read") {
+        const filePath =
+          input.filePath ?? input.path ?? input.file ?? input.target ?? undefined;
+        if (filePath) {
+          const total = trackFileRead(fileReads, filePath, cwd);
+          if (total > FILE_SCAN_LIMIT) {
+            report("file-scan", `${filePath} read ${total} times`);
+            if (blockEnabled) {
+              return { block: true, reason: `loop: file-scan ${filePath} read ${total} times` };
+            }
+          }
+        }
+      }
+
+      // --- search-spiral: structured `grep` calls only, not bash --------
+      if (input && toolName === "grep") {
+        const pattern =
+          input.pattern ?? input.query ?? input.search ?? input.term ?? undefined;
+        const location =
+          input.path ?? input.location ?? input.target ?? input.directory ?? undefined;
+        if (pattern && location) {
+          const distinct = trackSearch(searchPaths, pattern, location);
+          if (distinct > SEARCH_EXPAND_LIMIT) {
+            report("search-spiral", `${pattern} across ${distinct} locations`);
+            if (blockEnabled) {
+              return { block: true, reason: `loop: search-spiral ${pattern} across ${distinct} locations` };
+            }
+          }
         }
       }
     } catch {
@@ -406,19 +703,54 @@ export default function (pi: any) {
     }
   });
 
-  // --- turn_end: backstop for prose + reasoning --------------------------
+  // --- turn_end: stagnation + reasoning backstop --------------------------
   pi.on("turn_end", async (event: any, ctx: any) => {
     try {
       if (!statusPath) return;
-      const msg = event?.message ?? lastAssistantMessage(ctx);
-      if (!msg) return;
 
-      const text = extractAssistantText(msg);
-      if (text) {
-        const hit = detectProse(text);
-        if (hit) report("prose", `repeating "${hit.phrase}" x${hit.count}`);
+      // --- stagnation: fingerprint this turn's thinking -----------------
+      const msg = event?.message ?? lastAssistantMessage(ctx);
+      if (msg) {
+        const thinking = extractAssistantThinking(msg);
+        if (thinking) {
+          const fpSet = paragraphFingerprints(thinking);
+          stagnationWindow.push(fpSet);
+          if (stagnationWindow.length > STAGNATION_WINDOW) {
+            stagnationWindow.shift();
+          }
+          // Compare against the union of prior turns' sets.
+          if (stagnationWindow.length >= 2) {
+            const prior = unionOfSets(stagnationWindow.slice(0, -1));
+            const sim = jaccardSimilarity(fpSet, prior);
+            if (sim >= STAGNATION_THRESHOLD) {
+              report(
+                "stagnation",
+                `${Math.round(sim * 100)}% similar across last ${stagnationWindow.length} turns`,
+              );
+              ledToLoop = fpSet;
+              rederiveEventCount = 0;
+              if (blockEnabled) {
+                try {
+                  ctx?.abort?.();
+                } catch {
+                  /* ignore */
+                }
+              }
+            }
+          }
+        }
       }
 
+      // --- prose backstop (existing) ------------------------------------
+      if (msg) {
+        const text = extractAssistantText(msg);
+        if (text) {
+          const hit = detectProse(text);
+          if (hit) report("prose", `repeating "${hit.phrase}" x${hit.count}`);
+        }
+      }
+
+      // --- reasoning backstop (existing) --------------------------------
       if (!producedText && !producedTool && reasoningChars >= REASONING_MAX_CHARS) {
         report(
           "reasoning",
@@ -429,4 +761,57 @@ export default function (pi: any) {
       /* never propagate */
     }
   });
+
+  // --- context: re-derive trim --------------------------------------------
+  pi.on("context", async (event: any, _ctx: any) => {
+    try {
+      if (!statusPath) return;
+      // Only trim when we have a led-to-loop set to compare against.
+      if (!ledToLoop || ledToLoop.size === 0) return;
+
+      let trimmed = 0;
+      for (const message of event.messages) {
+        if (!message || !Array.isArray(message.content)) continue;
+        // Only look at assistant messages.
+        if (message.role !== "assistant") continue;
+        // Gather thinking parts.
+        const thinkingParts: any[] = [];
+        for (const part of message.content) {
+          if (part && part.type === "thinking" && typeof part.thinking === "string") {
+            thinkingParts.push(part);
+          }
+        }
+        if (thinkingParts.length === 0) continue;
+        // Concatenate and fingerprint each thinking part individually.
+        const allFingerprints = new Set<string>();
+        for (const tp of thinkingParts) {
+          const fp = paragraphFingerprints(tp.thinking);
+          for (const f of fp) allFingerprints.add(f);
+        }
+        const sim = jaccardSimilarity(allFingerprints, ledToLoop);
+        if (sim >= REDERIVE_THRESHOLD) {
+          // Trim each thinking part (empty the thinking string) but leave
+          // the message and non-thinking parts intact.
+          for (const tp of thinkingParts) {
+            tp.thinking = "";
+          }
+          trimmed += thinkingParts.length;
+        }
+      }
+      if (trimmed > 0) {
+        report("rederive", `trimmed ${trimmed} re-derived thinking parts`);
+        ledToLoop = null;
+        rederiveEventCount = 0;
+      } else {
+        rederiveEventCount += 1;
+        if (rederiveEventCount >= REDERIVE_RESET_EVENTS) {
+          ledToLoop = null;
+          rederiveEventCount = 0;
+        }
+      }
+    } catch {
+      /* never propagate */
+    }
+  });
+
 }

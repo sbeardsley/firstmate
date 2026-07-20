@@ -505,7 +505,7 @@ fm_backend_cmux_send_key() {  # <target> <key> [expected-label]
 # no single-call atomic "run and submit" primitive (like herdr's `pane run`),
 # so this composes send (literal) + send-key enter, exactly like zellij's
 # equivalent - used for the fixed spawn-time commands (treehouse get, the
-# GOTMPDIR export).
+# GOTMPDIR and task-identity/loop-detector exports).
 fm_backend_cmux_send_text_line() {  # <target> <text> [expected-label]
   fm_backend_cmux_send_literal "$1" "$2" "${3:-}" || return 1
   fm_backend_cmux_send_key "$1" Enter "${3:-}"

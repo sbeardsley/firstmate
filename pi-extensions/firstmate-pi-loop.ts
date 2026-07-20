@@ -543,7 +543,9 @@ export default function (pi: any) {
       // --- session ban: always block regardless of FM_LOOP_BLOCK --------
       if (bannedTools.has(key)) {
         report("tool", `${toolName} session-banned`);
-        return { block: true, reason: "loop: banned for this session" };
+        if (banEnabled) {
+          return { block: true, reason: "loop: banned for this session" };
+        }
       }
 
       // --- per-call adjacency detector (existing) -----------------------
@@ -671,7 +673,7 @@ export default function (pi: any) {
               rederiveEventCount = 0;
               if (blockEnabled) {
                 try {
-                  _ctx?.abort?.();
+                  ctx?.abort?.();
                 } catch {
                   /* ignore */
                 }
@@ -739,12 +741,12 @@ export default function (pi: any) {
         }
       }
       if (trimmed > 0) {
-        report("rededrive", `trimmed ${trimmed} re-derived thinking parts`);
+        report("rederive", `trimmed ${trimmed} re-derived thinking parts`);
         ledToLoop = null;
         rederiveEventCount = 0;
       } else {
         rederiveEventCount += 1;
-        if (rededriveEventCount >= REDERIVE_RESET_EVENTS) {
+        if (rederiveEventCount >= REDERIVE_RESET_EVENTS) {
           ledToLoop = null;
           rederiveEventCount = 0;
         }

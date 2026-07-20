@@ -726,6 +726,7 @@ crew_dispatch_validate() {
       + (if (.default? | type) == "object" then ["BOOTSTRAP_INFO: crew dispatch default: " + profile(.default)] else [] end))
     | .[]
   ' "$file"
+    "$SCRIPT_DIR/fm-dispatch-select.sh" --quota-vendor-facts < "$file" || true
   fi
 }
 
